@@ -1,15 +1,19 @@
 """
 Nuclei Vulnerability Scanning Module for ReconDragon
 
-Runs nuclei vulnerability scans with JSON output.
+Integrates Nuclei templated scans with JSON output and fallback capabilities.
 """
 
 import json
 import logging
+import os
 import subprocess
 import time
+import hashlib
+import tempfile
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union, Optional
+from shutil import which
 
 from base import BaseModule
 
@@ -18,14 +22,16 @@ logger = logging.getLogger(__name__)
 
 class NucleiModule(BaseModule):
     """
-    Nuclei vulnerability scanning module for ReconDragon.
+    Nuclei vulnerability scanning module with templated scans and fallback.
 
-    Runs nuclei templates against targets with configurable severity and tags.
+    Provides comprehensive vulnerability detection using Nuclei templates,
+    with safe fallback for offline environments.
     """
 
     def __init__(self):
-        self.timeout = 1800  # 30 minutes timeout
-        self.templates_dir = "/opt/nuclei-templates"  # Default nuclei templates location
+        self.timeout: int = int(os.getenv("NUCLEI_TIMEOUT", "1800"))  # 30 minutes default
+        self.templates_index_path: str = os.getenv("NUCLEI_TEMPLATES_INDEX", "templates_index.json")
+        self.workspace_authorized: bool = os.getenv("WORKSPACE_AUTHORIZED", "false").lower() == "true"
 
     @property
     def name(self) -> str:
@@ -33,131 +39,234 @@ class NucleiModule(BaseModule):
 
     @property
     def version(self) -> str:
-        return "1.0.0"
+        return "2.0.0"
 
-    def _parse_nuclei_output(self, json_file: Path) -> List[Dict[str, Any]]:
-        """Parse nuclei JSON output."""
-        if not json_file.exists():
-            return []
+    def _check_tool_availability(self) -> bool:
+        """Check if nuclei is available."""
+        return which("nuclei") is not None
+
+    def _generate_job_id(self, targets: List[str]) -> str:
+        """Generate a job ID based on targets."""
+        target_str = "|".join(sorted(targets))
+        return hashlib.md5(target_str.encode()).hexdigest()[:8]
+
+    def _build_nuclei_commands(self, targets: List[str], outdir: str, templates_path: Optional[str],
+                              severity: str, threads: int) -> List[List[str]]:
+        """Build nuclei command(s) for execution."""
+        commands = []
+
+        # Prepare target input
+        if len(targets) == 1:
+            target_arg = ["-u", targets[0]]
+        else:
+            # Write targets to temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write('\n'.join(targets))
+                target_file = f.name
+            target_arg = ["-l", target_file]
+
+        base_cmd = ["nuclei", "-oJ", "-severity", severity, "-c", str(threads)]
+
+        if templates_path:
+            base_cmd.extend(["-t", templates_path])
+
+        base_cmd.extend(target_arg)
+
+        # Split into multiple commands if needed (for now, single command)
+        commands.append(base_cmd)
+
+        return commands
+
+    def _run_nuclei(self, commands: List[List[str]], outdir: str, job_id: str) -> bool:
+        """Execute nuclei commands."""
+        output_file = Path(outdir) / f"nuclei_{job_id}.json"
+
+        # For simplicity, run the first command and append to output
+        cmd = commands[0] + ["-o", str(output_file)]
 
         try:
-            results = []
-            with open(json_file, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        results.append(json.loads(line))
-            return results
-        except (json.JSONDecodeError, FileNotFoundError) as e:
-            logger.error(f"Failed to parse nuclei output: {e}")
+            logger.info(f"Running nuclei command: {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False
+            )
+            if result.returncode == 0:
+                logger.info("Nuclei scan completed successfully")
+                return True
+            else:
+                logger.error(f"Nuclei failed with return code {result.returncode}: {result.stderr}")
+                return False
+        except subprocess.TimeoutExpired:
+            logger.error("Nuclei scan timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Error running nuclei: {e}")
+            return False
+
+    def _parse_nuclei_output(self, output_file: Path) -> List[Dict[str, Any]]:
+        """Parse nuclei JSON output."""
+        if not output_file.exists():
             return []
 
-    def run(self, target: str, outdir: str, execute: bool = False, **kwargs) -> Dict[str, Any]:
+        findings = []
+        try:
+            with open(output_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        findings.append(json.loads(line))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to parse nuclei output: {e}")
+
+        return findings
+
+    def _prioritize_findings(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Group findings by severity and provide samples."""
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        grouped = {"critical": [], "high": [], "medium": [], "low": [], "info": []}
+
+        for finding in findings:
+            sev = finding.get("info", {}).get("severity", "info").lower()
+            if sev in grouped:
+                grouped[sev].append(finding)
+
+        prioritized = {}
+        for sev in ["critical", "high", "medium", "low", "info"]:
+            if grouped[sev]:
+                prioritized[sev] = {
+                    "count": len(grouped[sev]),
+                    "sample_findings": grouped[sev][:5]  # First 5 as samples
+                }
+
+        return prioritized
+
+    def _fallback_scan(self, targets: List[str], outdir: str, templates_path: Optional[str],
+                      severity: str) -> Dict[str, Any]:
+        """Conservative fallback using keyword matching against templates index."""
+        logger.info("Nuclei not available, using fallback keyword matching")
+
+        # Load templates index
+        index_path = Path(templates_path or self.templates_index_path)
+        if not index_path.exists():
+            logger.warning(f"Templates index not found: {index_path}")
+            return {"fallback_findings": [], "note": "Templates index not available"}
+
+        try:
+            with open(index_path, 'r') as f:
+                templates = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to load templates index: {e}")
+            return {"fallback_findings": [], "note": "Failed to load templates index"}
+
+        findings = []
+        severity_list = severity.split(',')
+
+        # Very conservative: check if target URLs contain keywords from templates
+        # This is a placeholder for actual HTTP header/banner checking
+        for target in targets:
+            for template in templates.get("templates", []):
+                if template.get("info", {}).get("severity", "").lower() in severity_list:
+                    # Simple string match (very conservative)
+                    keywords = template.get("keywords", [])
+                    if any(keyword.lower() in target.lower() for keyword in keywords):
+                        findings.append({
+                            "template": template.get("id", "unknown"),
+                            "info": template.get("info", {}),
+                            "matched_url": target,
+                            "fallback": True
+                        })
+
+        return {
+            "fallback_findings": findings,
+            "note": "Conservative keyword matching against target URLs. Real banner/header checking not implemented."
+        }
+
+    def run(self, target: Union[str, List[str]], outdir: str, execute: bool = False,
+            templates_path: Optional[str] = None, severity: str = "low,medium,high,critical",
+            threads: int = 10) -> Dict[str, Any]:
         """
         Execute nuclei vulnerability scanning.
 
         Args:
-            target: Target URL or IP
-            outdir: Output directory
-            execute: Whether to actually run the scan
-            **kwargs: Additional options (severity, tags, templates, etc.)
+            target: Target URL(s) or IP(s) (str or list)
+            outdir: Output directory for results
+            execute: Whether to actually run nuclei
+            templates_path: Path to nuclei templates
+            severity: Comma-separated severity levels
+            threads: Number of concurrent threads
 
         Returns:
-            Dict with standardized module results
+            Dict with scan results and findings
         """
-        start_time = time.time()
+        targets = [target] if isinstance(target, str) else target
+        if not targets:
+            raise ValueError("No targets provided")
 
-        # Configuration from kwargs
-        severity = kwargs.get('severity', 'info,low,medium,high,critical')
-        tags = kwargs.get('tags', 'misc,generic')
-        templates = kwargs.get('templates', self.templates_dir)
-
+        job_id = self._generate_job_id(targets)
         output_dir = Path(outdir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        json_file = output_dir / "nuclei_results.json"
+        commands = self._build_nuclei_commands(targets, str(output_dir), templates_path, severity, threads)
 
-        # Build nuclei command
-        cmd = [
-            "nuclei",
-            "-u", target,
-            "-json",
-            "-o", str(json_file),
-            "-severity", severity,
-            "-tags", tags,
-            "-t", templates,
-            "-timeout", "10",  # Request timeout
-            "-rate-limit", "150"  # Requests per second
-        ]
+        if not execute:
+            return {
+                "module": self.name,
+                "version": self.version,
+                "status": "dry-run",
+                "job_id": job_id,
+                "commands": commands,
+                "targets": targets,
+                "templates_path": templates_path,
+                "severity": severity,
+                "threads": threads,
+                "raw": {
+                    "note": "TODO: Respect workspace.authorized gating for aggressive templates"
+                }
+            }
 
-        # Add additional options
-        if kwargs.get('no-interactsh', True):
-            cmd.append("-no-interactsh")
-
+        # Execute mode
         success = False
-        error_msg = None
-        raw_output = None
+        findings = []
 
-        if execute:
-            try:
-                logger.info(f"Running nuclei scan on {target}")
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    check=True
-                )
-                success = True
-                raw_output = result.stdout
-                logger.info("Nuclei scan completed successfully")
-            except subprocess.TimeoutExpired:
-                error_msg = "Nuclei scan timed out"
-                logger.error(error_msg)
-            except subprocess.CalledProcessError as e:
-                error_msg = f"Nuclei failed: {e.stderr}"
-                logger.error(error_msg)
-            except FileNotFoundError:
-                error_msg = "nuclei binary not found. Please install nuclei."
-                logger.error(error_msg)
+        if self._check_tool_availability():
+            success = self._run_nuclei(commands, str(output_dir), job_id)
+            if success:
+                output_file = output_dir / f"nuclei_{job_id}.json"
+                findings = self._parse_nuclei_output(output_file)
         else:
-            # Dry-run
-            logger.info(f"Dry-run: Would execute {' '.join(cmd)}")
-            success = True
+            fallback_result = self._fallback_scan(targets, str(output_dir), templates_path, severity)
+            findings = fallback_result.get("fallback_findings", [])
 
-        # Parse results
-        vulnerabilities = self._parse_nuclei_output(json_file)
+        prioritized_findings = self._prioritize_findings(findings)
 
-        end_time = time.time()
+        # Count total by severity
+        counts = {}
+        for sev, data in prioritized_findings.items():
+            counts[sev] = data["count"]
 
-        # Categorize by severity
-        severity_counts = {}
-        for vuln in vulnerabilities:
-            sev = vuln.get('info', {}).get('severity', 'unknown')
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-
-        summary = {
-            "target": target,
-            "vulnerabilities_found": len(vulnerabilities),
-            "severity_breakdown": severity_counts,
-            "templates_used": templates,
-            "scan_duration": round(end_time - start_time, 2)
-        }
-
-        if error_msg:
-            summary["error"] = error_msg
-
-        artifacts = []
-        if json_file.exists():
-            artifacts.append(str(json_file))
-
-        return {
+        result = {
             "module": self.name,
             "version": self.version,
-            "target": target,
-            "start_time": start_time,
-            "end_time": end_time,
-            "success": success,
-            "summary": summary,
-            "artifacts": artifacts,
-            "raw": raw_output
+            "status": "completed" if success else "fallback" if findings else "failed",
+            "job_id": job_id,
+            "targets": targets,
+            "findings": prioritized_findings,
+            "counts": counts,
+            "total_findings": sum(counts.values()),
+            "artifacts": [str(output_dir / f"nuclei_{job_id}.json")] if success else [],
+            "raw": {
+                "commands": commands,
+                "templates_path": templates_path,
+                "severity": severity,
+                "threads": threads,
+                "note": "TODO: Respect workspace.authorized gating for aggressive templates"
+            }
         }
+
+        if not success and not findings:
+            result["error"] = "Nuclei not available and fallback found no matches"
+
+        return result
